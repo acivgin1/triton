@@ -12,6 +12,7 @@
 #include "triton/ir/module.h"
 #include "triton/ir/function.h"
 #include "triton/ir/type.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
@@ -837,13 +838,11 @@ void generator::visit_get_num_programs_inst(ir::get_num_programs_inst* np) {
  * \brief Code Generation for `exp`
  */
 void generator::visit_exp_inst(ir::exp_inst* x){
-  Constant *log2e = ConstantFP::get(f32_ty, 1.4426950408889634);
   std::vector<llvm::Type*> tys = {f32_ty};
   FunctionType *fn_ty = FunctionType::get(f32_ty, tys, false);
-  InlineAsm *ex2 = InlineAsm::get(fn_ty, "ex2.approx.f32 $0, $0;", "=f,0", false);
+  llvm::Function* ex2 = mod_->getFunction("__nv_expf");
   for(auto idx: idxs_.at(x)){
-    Value *ex2arg = fmul(vals_[x->get_operand(0)][idx], log2e);
-    vals_[x][idx] = call(ex2, std::vector<llvm::Value*>{ex2arg});
+    vals_[x][idx] = call(ex2, std::vector<llvm::Value*>{vals_[x->get_operand(0)][idx]});
   }
 }
 
@@ -2666,6 +2665,17 @@ void generator::finalize_phi_node(ir::phi_node *x) {
   }
 }
 
+void generator::defineExternalFunction(llvm::StringRef func_name, llvm::Type *return_typ, llvm::ArrayRef<llvm::Type *> params_typ, bool is_var_arg) {
+  llvm::FunctionType *func_ty = llvm::FunctionType::get(return_typ, params_typ, is_var_arg);
+  llvm::Function *func = mod_->getFunction(func_name);
+  if (func) {
+    // TODO: handle case of some function having the same name
+    // NOTE: highly unlikely
+    return;
+  }
+  func = llvm::Function::Create(func_ty, llvm::Function::ExternalLinkage, func_name, mod_);
+}
+
 void generator::visit(ir::module &src, llvm::Module &dst) {
   mod_ = &dst;
   ctx_ = &dst.getContext();
@@ -2682,6 +2692,11 @@ void generator::visit(ir::module &src, llvm::Module &dst) {
                          nullptr, "__shared_ptr", nullptr, GlobalVariable::NotThreadLocal, 3);
     shmem_ = bit_cast(sh_mem_array, ptr_ty);
   }
+
+  llvm::SmallVector<llvm::Type *, 1> params_typ;
+  params_typ.push_back(f32_ty);
+  defineExternalFunction("__nv_expf", f32_ty, params_typ, false);
+
   // visit functions
   for(ir::function *fn: src.get_function_list())
     visit_function(fn);

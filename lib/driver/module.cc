@@ -30,10 +30,12 @@
 #include "triton/tools/sys/getenv.hpp"
 #include "triton/tools/sys/mkdir.hpp"
 #include "triton/tools/sys/exec.hpp"
+#include "llvm/IRReader/IRReader.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Linker/Linker.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/SourceMgr.h"
@@ -42,6 +44,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/Transforms/IPO.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
@@ -234,6 +237,13 @@ int vptx(int version){
   throw std::runtime_error("Triton requires CUDA 10+");
 }
 
+bool cb_preserve_gv(const llvm::GlobalValue &GV) {
+  llvm::StringRef name = GV.getName();
+  // TODO: check if the name is in a list of names that should be preserved from internalization
+  // https://github.com/llvm/llvm-project/blob/main/llvm/lib/Transforms/IPO/Internalize.cpp#L48-L88
+  return false;
+}
+
 std::string cu_module::compile_llvm_module(llvm::Module* module, driver::device* device) {
   // LLVM version in use may not officially support target hardware
   int max_nvvm_cc = 75;
@@ -249,6 +259,9 @@ std::string cu_module::compile_llvm_module(llvm::Module* module, driver::device*
   // driver version
   int version;
   dispatch::cuDriverGetVersion(&version);
+  int ver_major = version / 1000;
+  int ver_minor = (version % 100) / 10;
+
   int ptx = vptx(version);
   int ptx_major = ptx / 10;
   int ptx_minor = ptx % 10;
@@ -259,9 +272,27 @@ std::string cu_module::compile_llvm_module(llvm::Module* module, driver::device*
   std::string layout = "";
   std::string features = "+ptx" + std::to_string(std::min(ptx, max_nvvm_ptx));
   init_llvm();
+
+  llvm::SMDiagnostic parse_error;
+  // TODO: maybe expose this from outside, so users can specify their cuda installation path
+  std::string lib_device_path = "/usr/local/cuda-" + std::to_string(ver_major) + "." + std::to_string(ver_minor) + "/nvvm/libdevice/libdevice.10.bc";
+  std::unique_ptr<llvm::Module>m = llvm::parseIRFile(lib_device_path, parse_error, module->getContext());
+  if (!m) {
+    parse_error.print("", llvm::errs());
+    // exception translation get's handled by pybind
+    throw std::exception();
+  }
+
+  llvm::Linker linker = llvm::Linker(*module);    // Step 2
+  bool link_failed = linker.linkInModule(move(m), llvm::Linker::Flags::LinkOnlyNeeded);
+  if (link_failed) {
+    throw std::exception();
+  }
+
   // verify and store llvm
   llvm::legacy::PassManager pm;
   pm.add(llvm::createVerifierPass());
+  // pm.add(llvm::createNVVMReflectPass());  // TODO: missing headers for this, expected in llvm/Target/NVPTX/NVVMReflect.h
   pm.run(*module);
   // create machine
   module->setTargetTriple(triple);
@@ -283,6 +314,9 @@ std::string cu_module::compile_llvm_module(llvm::Module* module, driver::device*
   for (llvm::Function &f : module->functions())
     f.addFnAttr(llvm::Attribute::AlwaysInline);
   llvm::legacy::PassManager pass;
+  pass.add(llvm::createInternalizePass(cb_preserve_gv));  // Step 3
+  // Step 4. Already handled by the linker, without the linker setting this seems to have no effect
+  // pass.add(llvm::createStripDeadPrototypesPass()); 
   llvm::raw_svector_ostream stream(buffer);
   // emit
   machine->addPassesToEmitFile(pass, stream, nullptr, llvm::CodeGenFileType::CGFT_AssemblyFile);

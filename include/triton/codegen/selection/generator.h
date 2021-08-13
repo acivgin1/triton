@@ -10,6 +10,9 @@
 // forward
 namespace llvm{
   class Type;
+  class StringRef;
+  template <typename T>
+  class ArrayRef;
   class Value;
   class PHINode;
   class BasicBlock;
@@ -189,6 +192,8 @@ public:
   void visit_basic_block(ir::basic_block*);
   void visit_argument(ir::argument*);
   void visit(ir::module &, llvm::Module &);
+
+  void defineExternalFunction(llvm::StringRef, llvm::Type *, llvm::ArrayRef<llvm::Type *>, bool);
 
   // layouts
   void visit_layout_mma(analysis::mma_layout*);
